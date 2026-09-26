@@ -37,6 +37,7 @@ Per-model image rejection (400/422) is an UpstreamError -> next fallback.
 """
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -378,6 +379,10 @@ def resolve_session_dir(project_paths: list[str] | None) -> Path:
     """
     for p in (project_paths or []):
         try:
+            if _is_scratch_path(p):
+                # Claude's own ephemeral session dir is where IT puts files; it
+                # is invisible to the user, so it must never win as work_dir.
+                continue
             cand = Path(p)
             if cand.is_dir():
                 return cand
@@ -741,9 +746,16 @@ def extract_request_images(messages: list) -> tuple[list[dict], int, int, list[s
             status.append("omitted")
             continue
         try:
-            name = uuid.uuid4().hex + "." + ext
+            # Content-addressed name. Claude Desktop re-sends the SAME screenshot
+            # on every turn, so the uuid scheme wrote one full copy per turn (11
+            # files for 2 screenshots in the reported session, 364KB each). Same
+            # bytes -> same file; touching it keeps the TTL pruner honest.
+            name = hashlib.sha1(raw).hexdigest()[:32] + "." + ext
             dest = IMG_DIR / name
-            dest.write_bytes(raw)
+            if dest.exists():
+                os.utime(dest, None)
+            else:
+                dest.write_bytes(raw)
             total_bytes += len(raw)
             files.append({"path": str(dest.resolve()),
                           "mime": "image/png" if ext == "png" else "image/jpeg",
@@ -776,6 +788,14 @@ PROGRESS_LEDGER = os.getenv("GATEWAY_PROGRESS_LEDGER", "true").lower() != "false
 # Log which project folder the gateway resolved, every request. This is the
 # first thing to check when the agent opens the wrong folder.
 PROJECT_LOG = os.getenv("GATEWAY_PROJECT_LOG", "true").lower() != "false"
+# When the free model answers the STRICT-JSON decision prompt with prose, ask
+# ONCE more for JSON instead of silently discarding every tool of the turn.
+DECISION_JSON_RETRY = os.getenv("GATEWAY_DECISION_JSON_RETRY", "true").lower() != "false"
+_JSON_ONLY_NUDGE = (
+    "\n\nFORMAT ERROR in your previous reply: it was prose, not the JSON object "
+    "the format section demanded. Reply AGAIN with ONLY that JSON - no prose, no "
+    "markdown fence, no explanation. If this turn genuinely needs no tool call, "
+    'answer with {"content": [{"type": "text", "text": "..."}]} instead.')
 
 
 def flatten_messages(messages: list,
@@ -932,6 +952,10 @@ READ_ONLY_STREAK_THRESHOLD = 8  # this many read-only calls in a row => stall
 # the exact-repeat and streak checks both miss.
 EXPLORE_STALL_THRESHOLD = 6
 LOOP_WINDOW = 12
+# "I am writing it right now" said N times in a row with no tool call behind
+# it. This is the loop the user actually sees (the model keeps promising the
+# same file), so it gets its own, lower threshold.
+PROMISE_STREAK_THRESHOLD = _int_env("GATEWAY_PROMISE_STREAK_THRESHOLD", 2)
 
 
 def _canonical_tool_input(inp) -> str:
@@ -942,17 +966,6 @@ def _canonical_tool_input(inp) -> str:
         return str(inp)[:500]
 
 
-def detect_tool_loop(messages: list) -> tuple[list[tuple[str, int]], int]:
-    """Scan assistant tool_use blocks in the request history.
-
-    Returns (repeated, read_only_streak): repeated is [(desc, count)]
-    for exact tool calls (name + canonical input) seen >= threshold;
-    read_only_streak is the trailing run of read-only calls.
-    Stateless: everything comes from the history in this request.
-
-    Only the last LOOP_WINDOW calls are examined: a repeat that happened
-    20 turns ago is normal agent behaviour, not a loop.
-    """
 def _tool_kind(name: str) -> str:
     """'read' | 'mutate' | 'neutral' for a tool name (substring match, lowercase)."""
     low = name.lower()
@@ -1017,7 +1030,138 @@ def detect_tool_loop(messages: list) -> tuple[list[tuple[str, int]], int, int]:
     return repeated, streak, explore_stall
 
 
-_PATH_RE = re.compile(r"(?:^|[\s\"'(<])((?:[A-Za-z]:[\\/]|\\\\)[^\s\"'`<>|*?]{2,200})")
+# ------------- broken promises (the "I am writing it" loop) -------------
+# The reported symptom: "باشه — دارم داشبورد را می‌سازم" five turns in a row and
+# no file anywhere. Mechanism: this bridge is stateless, so every turn re-reads
+# its own earlier promises in the transcript and a promise is the cheapest
+# possible continuation. Nothing in the prompt ever said "you already promised
+# that and NOTHING happened", so the model kept re-promising. Persian matters
+# here: the user's language is Persian, and an English-only heuristic would
+# never see the promise at all.
+_INTENT_RX = re.compile(
+    r"(?:دارم\s|می\u200c?نویسم|می\u200c?نویسیم|می\u200c?سازم|می\u200c?سازیم"
+    r"|خواهم نوشت|شروع می\u200c?کنم|الان می\u200c?نویسم"
+    r"|\b(?:i'?ll|i will|let me|i am|i'm|going to)\s+(?:now\s+)?"
+    r"(?:write|create|build|generate|start)\b"
+    r"|\bnow\s+(?:writing|creating|building|generating)\b)",
+    re.IGNORECASE)
+
+
+def detect_broken_promises(messages: list) -> int:
+    """Count trailing assistant turns that PROMISED an action, tool_use-less.
+
+    Scans backwards and stops at the first assistant turn that either carried a
+    tool_use (the agent is acting - nothing to warn about) or was plain text
+    without an intent phrase (a real answer, streak broken). A normal agent
+    that keeps calling tools therefore always scores 0, however much it talks.
+    """
+    streak = 0
+    for m in reversed(messages or []):
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        content = m.get("content", "")
+        texts: list[str] = []
+        has_use = False
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_use":
+                    has_use = True
+                elif b.get("type") == "text" and isinstance(b.get("text"), str):
+                    texts.append(b["text"])
+        if has_use:
+            return streak
+        joined = " ".join(texts).strip()
+        if joined and _INTENT_RX.search(joined):
+            streak += 1
+        elif joined:
+            return streak
+    return streak
+
+
+# A Windows folder name may contain SPACES. The old character class stopped at
+# the first space, so "H:\AI\Claude Desktop" was reported as "H:\AI\Claude":
+# that path fails is_dir(), the real project was silently dropped, and the
+# session fell back to whatever OTHER path the transcript happened to mention
+# (Claude Desktop's ephemeral ...\outputs folder). Deliverables then landed
+# where the user never looks - the root cause of "it says it wrote the file but
+# my folder is empty". The tail now allows up to 3 extra space-separated
+# segments; _trim_path() + _longest_existing_dir() undo whatever the greedy
+# match swallowed.
+_PATH_SEG = r"[^\s\"'`<>|*?]"
+_PATH_RE = re.compile(
+    r"(?:^|[\s\"'(<])(((?:[A-Za-z]:[\\/]|\\\\)" + _PATH_SEG + r"{2,200})"
+    r"(?:\s+" + _PATH_SEG + r"{1,200}){0,3})")
+_PATH_TRAILING = " \t.,;:)]}'\"”’"
+# Labels that end a path inside a system prompt line ("... Desktop\n3. Date").
+_PATH_LINE_END = re.compile(r"[\r\n]")
+# Folders that belong to the AGENT RUNTIME, not to the user. Writing there is
+# invisible to the user, so they must never be offered as "the project":
+#   local-agent-mode-sessions\...\outputs  - Claude Desktop local agent mode
+#   skills-plugin                          - Claude Desktop skill cache
+# (Found in the wild: the outputs dir outranked the user's real folder.)
+_SCRATCH_MARKERS = tuple(m.strip().lower() for m in
+                         os.getenv("GATEWAY_SCRATCH_MARKERS",
+                                   "local-agent-mode-sessions,skills-plugin"
+                                   ).split(",") if m.strip())
+
+
+def _is_scratch_path(p: str) -> bool:
+    """True for our sandbox and for the agent runtime's own hidden folders."""
+    low = str(p).lower().replace("/", "\\")
+    if SESSION_DIR.name.lower() in low:
+        return True
+    return any(m in low for m in _SCRATCH_MARKERS)
+
+
+def _trim_path(raw: str) -> str:
+    """Clean one regex match down to a plausible path.
+
+    Keeps single spaces ("Claude Desktop") but cuts at a double space, at a
+    line break, and at trailing punctuation - none of which belong to the
+    folder the user meant.
+    """
+    p = str(raw).strip()
+    p = _PATH_LINE_END.split(p)[0].strip()
+    dbl = re.search(r"\s{2,}", p)
+    if dbl:  # a real folder name never contains two consecutive spaces
+        p = p[:dbl.start()]
+    p = p.strip().rstrip(_PATH_TRAILING).strip()
+    if len(p) > 250:
+        cut = p[:250]
+        # Never end in the middle of a name: fall back to the last whole
+        # segment. A truncated path is worse than a short one - it points at a
+        # folder that does not exist.
+        tail = cut.rfind(" ")
+        p = cut[:tail] if tail > 2 else cut
+    return p
+
+
+def _longest_existing_dir(p: str) -> str:
+    """Prefer the space-joined prefix that really IS a directory.
+
+    The greedy match can swallow sentence words ("H:\\AI\\proj and the rest");
+    the longest prefix that exists on disk is the folder the user meant. When
+    nothing exists, the match is returned unchanged so the caller can still
+    report it.
+    """
+    try:
+        if not p or " " not in p:
+            return p
+        if os.path.isdir(p):
+            return p
+        toks = p.split(" ")
+        for n in range(len(toks) - 1, 1, -1):
+            cand = " ".join(toks[:n])
+            if os.path.isdir(cand):
+                return cand
+    except Exception:
+        pass
+    return p
+
 # Claude Desktop puts the attached project folder in the SYSTEM prompt as
 # "Working directory: <path>" (inside an <env> block). It is NOT in the
 # messages, which is why the model kept asking for a folder the user had
@@ -1048,12 +1192,12 @@ def discover_cwd_paths(system: str | list | None) -> list[str]:
     out: list[str] = []
     for rx in (_CWD_RE, _ATTACH_RE):
         for m in rx.finditer(text):
-            p = m.group(1).strip().rstrip(".,;:)]}'\"")
-            if SESSION_DIR.name.lower() in p.lower():
-                continue  # our own sandbox is never the user's project
+            p = _longest_existing_dir(_trim_path(m.group(1)))
+            if _is_scratch_path(p):
+                continue  # sandbox / Claude's own dirs are never the project
             if p.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
                 continue
-            if p not in out:
+            if p and p not in out:
                 out.append(p)
         if out:
             break  # the explicit "working directory" wins over looser matches
@@ -1096,13 +1240,14 @@ def discover_project_paths(messages: list) -> list[str]:
                         texts.append(c[:400])
         for t in texts:
             for match in _PATH_RE.finditer(t):
-                p = match.group(1).rstrip(".,;:)]}'\"")
-                # Skip our own sandbox and image files: they are not the project.
-                if SESSION_DIR.name.lower() in p.lower():
+                p = _longest_existing_dir(_trim_path(match.group(1)))
+                # Skip the sandbox, the agent runtime's own folders and image
+                # files: none of them is the user's project.
+                if _is_scratch_path(p):
                     continue
                 if p.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
                     continue
-                if p not in found:
+                if p and p not in found:
                     found.append(p)
     return found
 
@@ -1195,6 +1340,16 @@ def _workspace_note(paths: list[str] | None = None) -> str:
             "Claude Desktop. Use this exact path:")
         for p in paths[:5]:
             lines.append(f"    * {p}")
+            if " " in p:
+                lines.append(
+                    f"      (this name contains a SPACE - pass it whole and quoted, "
+                    f"\"{p}\", and NEVER cut it at the space)")
+        others = [p for p in paths[1:5] if p != wd]
+        if others:
+            lines.append(
+                "- Anything else in that list is older context (a file you already "
+                "opened, a folder merely mentioned). It is NOT the project root and "
+                "never a place to put the deliverable: " + "; ".join(others))
         lines.append(
             "- That folder is the ONLY scope. If any other path shows up in this "
             "conversation (a file read earlier, a folder merely mentioned, a sibling "
@@ -1224,7 +1379,8 @@ def build_tool_decision_prompt(tools: list, tool_choice, transcript: str,
                                explore_stall: int = 0,
                                project_paths: list | None = None,
                                done_reads: list | None = None,
-                               done_writes: list | None = None) -> str:
+                               done_writes: list | None = None,
+                               promise_streak: int = 0) -> str:
     if isinstance(max_tokens, bool):
         budget = 2000
     elif isinstance(max_tokens, int):
@@ -1282,6 +1438,16 @@ def build_tool_decision_prompt(tools: list, tool_choice, transcript: str,
                   f"This turn you MUST either (a) make the actual edit with Edit/Write, "
                   f"or (b) reply with a final text summary of what you found. "
                   f"Answering 'I will continue' and reading more files is forbidden."]
+    if promise_streak >= PROMISE_STREAK_THRESHOLD:
+        parts += ["",
+                  f"REPEAT GUARD: your last {promise_streak} replies promised to "
+                  f"write/create something but contained NO tool_use, so nothing ever "
+                  f"happened and the user is about to read that same promise again. "
+                  f"The file does NOT exist yet. This turn you MUST either (a) emit the "
+                  f"real tool call (Write/Edit) with the full absolute path inside the "
+                  f"project folder listed above, or (b) state in one sentence what is "
+                  f"blocking you. Announcing that you are about to write is forbidden - "
+                  f"write it."]
     if system_text:
         parts += ["", "System:", system_text]
     parts += ["", ("Keep text parts concise. Ensure every tool_use input is a JSON object "
@@ -1398,11 +1564,83 @@ def _extract_decision_json(raw: str) -> dict | None:
     return None
 
 
-def _validate_decision_items(data: dict, valid_names: set[str]) -> list[dict] | None:
-    """Keep text/tool_use items; drop unknown tools; cap 4 tool_use. None = unusable."""
+def _tool_schema(tool: dict) -> dict | None:
+    """The tool's declared input schema, or None when it never declared one."""
+    if not isinstance(tool, dict):
+        return None
+    schema = tool.get("input_schema") or tool.get("parameters")
+    return schema if isinstance(schema, dict) else None
+
+
+def _required_keys(tool: dict) -> set:
+    """Required top-level keys of a tool's input_schema, if declared."""
+    schema = _tool_schema(tool)
+    if not schema:
+        return set()
+    req = schema.get("required")
+    if isinstance(req, list):
+        return {str(k) for k in req}
+    return set()
+
+
+def _input_is_usable(name: str, inp: dict, tool_by_name: dict) -> bool:
+    """Reject meaningless tool input instead of forwarding it.
+
+    The model sometimes emits a bare tool call with input {} (observed with
+    Read). Forwarding that makes the CLIENT fail, and the user sees an error
+    instead of a retry. Dropping it lets the model try again next turn.
+
+    BUT {} is the CORRECT input for a zero-argument tool (TaskList, ClearGoal,
+    ...). Dropping those was a self-inflicted loop: the call vanished before
+    the client ever saw it, no tool_result came back, and the model repeated
+    "first let me check the task list" every single turn - exactly the
+    repetition in the reported logs ("dropping tool_use 'TaskList' with empty
+    input" three times in seven minutes).
+
+    So: if the tool DECLARED a schema and that schema demands nothing, {} is
+    forwarded. Real Claude Desktop tools declare
+    {"type": "object", "properties": {}, "required": []} - no properties at
+    all - which is why "has at least one property" is NOT the test.
+    We only refuse when there is no schema to judge by (the tool never declared
+    one): a wrong-but-parseable call still comes back as a tool_result error the
+    model can react to, while a dropped call is silent and loops.
+    """
+    tool = tool_by_name.get(name)
+    req = _required_keys(tool) if isinstance(tool, dict) else set()
+    if not inp:
+        if not isinstance(tool, dict) or _tool_schema(tool) is None:
+            log.info("dropping tool_use '%s' with empty input (no schema to judge)",
+                     name[:80])
+            return False
+        if req:
+            log.info("dropping tool_use '%s' with empty input (needs %s)",
+                     name[:80], ",".join(sorted(req)))
+            return False
+        log.info("allowing zero-argument tool_use '%s' (schema demands nothing)",
+                 name[:80])
+        return True
+    if isinstance(tool, dict):
+        missing = [k for k in (req or set())
+                   if k not in inp or inp.get(k) in (None, "")]
+        if missing:
+            log.info("dropping tool_use '%s' missing required input %s",
+                     name[:80], ",".join(missing))
+            return False
+    return True
+
+
+def _validate_decision_items(data: dict, valid_names: set[str],
+                             tool_by_name: dict | None = None) -> list[dict] | None:
+    """Keep text/tool_use items; drop unknown tools; cap 4 tool_use. None = unusable.
+
+    tool_by_name (optional) enables input validation: a tool call whose input
+    is empty or missing a required key is dropped so the model can retry
+    instead of the client erroring out on a malformed call.
+    """
     content = data.get("content")
     if not isinstance(content, list):
         return None
+    by_name = tool_by_name or {}
     kept: list[dict] = []
     tool_count = 0
     for item in content:
@@ -1418,10 +1656,12 @@ def _validate_decision_items(data: dict, valid_names: set[str]) -> list[dict] | 
                 continue
             if tool_count >= MAX_TOOL_USE_BLOCKS:
                 continue
-            tool_count += 1
             inp = item.get("input", {})
             if not isinstance(inp, dict):
                 inp = {}
+            if by_name and not _input_is_usable(name, inp, by_name):
+                continue
+            tool_count += 1
             kept.append({"type": "tool_use", "name": name, "input": inp})
     if not kept:
         return None
@@ -1650,7 +1890,131 @@ def anthropic_sse(text: str, alias: str, msg_id: str, usage: dict) -> StreamingR
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
-# ---------------- blocking workers (run in a threadpool, never on the loop) --
+# ---------------- URL guard: make the model actually DO the task ------------
+# The model sometimes answers "I can't access that URL" (or similar) instead
+# of calling WebFetch/Bash, even though the tool is right there and the
+# network is fine. This is a known weakness of the small free models, not a
+# real restriction - we verified github.com fetches fine.
+_URL_RE = re.compile(r"https?://[^\s\"'`<>)\]}]+", re.IGNORECASE)
+# Refusal tells the model could not do it. Matched case-insensitively so both
+# English and Persian phrasings are caught.
+_REFUSAL_HINTS = (
+    "can't access", "cannot access", "cant access", "unable to access",
+    "can't reach", "cannot reach", "can't fetch", "cannot fetch",
+    "not able to", "no access to", "access is blocked", "blocked by",
+    "network egress", "restricted", "forbidden", "not allowed to",
+    "دسترسی ندارم", "دسترسی نیست", "بسته است", "مسدود", "ممنوع",
+    "امکان دسترسی", "نمیتوانم دسترسی", "نمی‌توانم به", "وصل نمی",
+)
+_WEB_TOOL_HINTS = ("webfetch", "websearch", "fetch", "search")
+# Re-ask once with a forced tool call when the model refuses a URL. Kill switch.
+URL_GUARD = os.getenv("GATEWAY_URL_GUARD", "true").lower() != "false"
+# The gateway itself fetches URLs the user pasted. This is REQUIRED in Claude
+# Desktop Cowork: its own WebFetch/WebSearch tools are killed by an
+# organization egress policy ("cowork-egress-blocked"), while this local
+# process reaches the internet fine (verified: github.com 200, 423KB).
+URL_FETCH = os.getenv("GATEWAY_URL_FETCH", "true").lower() != "false"
+URL_FETCH_MAX_BYTES = _int_env("GATEWAY_URL_FETCH_MAX_BYTES", 400_000)
+URL_FETCH_CHARS = _int_env("GATEWAY_URL_FETCH_CHARS", 24_000)
+URL_FETCH_TIMEOUT = _float_env("GATEWAY_URL_FETCH_TIMEOUT", 25.0)
+# Egress-policy wording the CLIENT returns when its own tools are blocked.
+_EGRESS_HINTS = (
+    "egress", "cowork-egress", "network egress", "organization's network",
+    "organization’s network", "ask your administrator", "proxy",
+    "failed to fetch", "blocked by your organization",
+)
+_SCRIPT_STYLE_RE = re.compile(r"<(script|style|noscript|svg)\b.*?</\1>",
+                              re.IGNORECASE | re.DOTALL)
+_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"[ \t\r\f\v]+")
+_BLANK_RE = re.compile(r"\n{3,}")
+
+
+def looks_like_egress_block(text: str) -> bool:
+    """True when the CLIENT's own web tool was blocked by policy.
+
+    Different from looks_like_refusal: here the tool DID run and came back
+    with an organization egress error, so telling the model "you can do it"
+    is useless - the gateway must fetch the page instead.
+    """
+    low = (text or "").lower()
+    return any(h in low for h in _EGRESS_HINTS)
+
+
+def html_to_text(html: str) -> str:
+    """Very small HTML -> text reducer (no extra dependencies)."""
+    txt = _SCRIPT_STYLE_RE.sub(" ", html or "")
+    txt = re.sub(r"<!--.*?-->", " ", txt, flags=re.DOTALL)
+    txt = re.sub(r"<(br|/p|/div|/li|/h[1-6]|/tr)\s*/?>", "\n", txt,
+                 flags=re.IGNORECASE)
+    txt = _TAG_RE.sub(" ", txt)
+    for ent, ch in (("&nbsp;", " "), ("&amp;", "&"), ("&lt;", "<"),
+                    ("&gt;", ">"), ("&quot;", '"'), ("&#39;", "'")):
+        txt = txt.replace(ent, ch)
+    txt = _WS_RE.sub(" ", txt)
+    txt = _BLANK_RE.sub("\n\n", txt)
+    return txt.strip()
+
+
+def fetch_url_text(url: str) -> str | None:
+    """Fetch one URL from THIS process and return readable text.
+
+    Returns None on any failure - the caller then leaves the model's own
+    answer untouched. Never raises, so a bad URL can't break a request.
+    """
+    if not URL_FETCH or not url.lower().startswith(("http://", "https://")):
+        return None
+    try:
+        with _new_client(timeout=URL_FETCH_TIMEOUT,
+                         follow_redirects=True) as c:
+            r = c.get(url, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; gateway/1.0)",
+                "Accept": "text/html,application/xhtml+xml,text/plain,*/*",
+            })
+        if r.status_code != 200:
+            log.info("url-fetch: %s -> http-%s", url[:120], r.status_code)
+            return None
+        raw = r.content[:URL_FETCH_MAX_BYTES]
+        ctype = r.headers.get("content-type", "").lower()
+        text = html_to_text(raw.decode("utf-8", "replace"))
+        if "html" not in ctype and "xml" not in ctype:
+            text = raw.decode("utf-8", "replace").strip()
+        if not text:
+            return None
+        log.info("url-fetch: %s -> %d chars", url[:120], len(text))
+        return text[:URL_FETCH_CHARS]
+    except Exception as e:
+        log.info("url-fetch: %s failed (%s)", url[:120], type(e).__name__)
+        return None
+
+
+def find_urls(text: str, limit: int = 3) -> list[str]:
+    return list(dict.fromkeys(_URL_RE.findall(text or "")))[:limit]
+
+
+def looks_like_refusal(text: str) -> bool:
+    low = (text or "").lower()
+    return any(h in low for h in _REFUSAL_HINTS)
+
+
+def has_web_tool(tool_by_name: dict) -> bool:
+    return any(any(h in name.lower() for h in _WEB_TOOL_HINTS) for name in tool_by_name)
+
+
+def build_url_guard_prompt(urls: list[str], tool_names: list[str]) -> str:
+    """The instruction used when the model refused instead of fetching."""
+    return (
+        "\n\nCRITICAL - you CAN reach these URLs, stop refusing:\n"
+        f"  {', '.join(urls)}\n"
+        f"You have these tools available: {', '.join(tool_names)}.\n"
+        "Network access works in this environment - do NOT invent a blocked-"
+        "network story. You MUST call a tool NOW:\n"
+        f"  1. Call {tool_names[0]} with that URL to read its content, OR\n"
+        f"  2. Call {tool_names[-1]} with a command that fetches it "
+        "(for example: curl -L <url>).\n"
+        "Answering with prose about the URL, or saying you cannot access it, is "
+        "FORBIDDEN. Your next reply must be a tool call."
+    )
 # Every upstream call is synchronous (httpx.Client + blocking reads). Running
 # it directly inside an `async def` endpoint blocks the whole event loop, so
 # /health stops answering and concurrent requests serialise behind one slow
@@ -1667,20 +2031,103 @@ def _chat_worker(alias: str, system: str, prompt: str,
 def _decision_worker(alias: str, decision_prompt: str, retry_prompt: str | None,
                      img_files: list[dict] | None, valid_names: set[str],
                      forced_name: str | None, deadline: float,
-                     work_dir: Path | None = None
+                     work_dir: Path | None = None,
+                     tool_by_name: dict | None = None,
+                     user_urls: list[str] | None = None,
+                     transcript: str = ""
                      ) -> tuple[str, str, dict, list[dict]]:
     """Run the tool-bridge decision (and optional forced retry) off-loop.
 
     Returns (raw, used_model, usage, items). items is already salvaged or
     text-wrapped, so the caller only has to assign ids and respond.
     """
+    by_name = tool_by_name or {}
     with _new_client(timeout=UPSTREAM_TIMEOUT) as client:
         raw, used_model, usage = chat_with_fallback(
             client, alias, "", decision_prompt,
             image_paths=img_files or None, deadline=deadline, work_dir=work_dir)
         data = _extract_decision_json(raw)
-        items = _validate_decision_items(data, valid_names) if data is not None else None
+        items = (_validate_decision_items(data, valid_names, by_name)
+                 if data is not None else None)
         tool_names = [i["name"] for i in items if i["type"] == "tool_use"] if items else []
+        # ---- URL guard -------------------------------------------------
+        # The user pasted a URL and the model could not use it. Two cases:
+        #  (a) the CLIENT's web tool is killed by an egress policy
+        #      ("cowork-egress-blocked") - that error shows up in the tool
+        #      RESULT, so we scan the transcript too, not just the reply;
+        #  (b) the model refused / hallucinated a block.
+        # In both, we retry ONCE: for (a) the gateway fetches the page itself
+        # (this process has working network) and hands the text over.
+        if URL_GUARD and user_urls and by_name:
+            text_only = (" ".join(i["text"] for i in items if i["type"] == "text")
+                         if items else raw)
+            refused = looks_like_refusal(text_only)
+            blocked = (looks_like_egress_block(text_only)
+                       or looks_like_egress_block(transcript))
+            # The model may also keep calling the SAME doomed web tool that the
+            # client already proved is blocked. Retrying it can never work, so
+            # treat "only web-tool calls + known egress block" as a failure too.
+            only_web_calls = bool(tool_names) and all(
+                any(h in n.lower() for h in _WEB_TOOL_HINTS) for n in tool_names)
+            stuck_on_web = only_web_calls and blocked
+            if (not tool_names or stuck_on_web) and (refused or blocked):
+                if stuck_on_web:
+                    log.info("url-guard: model keeps calling blocked web tools (%s)",
+                             ",".join(tool_names[:3]))
+                if deadline is not None and time.time() >= deadline:
+                    log.info("url-guard: skipped, time budget exhausted")
+                else:
+                    web_names = [n for n in by_name
+                                 if any(h in n.lower() for h in _WEB_TOOL_HINTS)]
+                    # Two different failure modes need two different fixes:
+                    #  (a) egress block -> the CLIENT's web tool is dead, so the
+                    #      gateway fetches the page itself and hands over text.
+                    #  (b) a plain refusal/hallucination -> re-ask, forcing a tool.
+                    # NOTE: reuse the outer `blocked` (it also scanned the
+                    # transcript for the tool_result error). Recomputing it from
+                    # the model's own text loses the block when the reply was a
+                    # bare tool call with no prose.
+                    fetched: list[tuple[str, str]] = []
+                    if blocked:
+                        log.info("url-guard: client egress blocked; gateway will fetch %s",
+                                 user_urls[0])
+                        for u in user_urls:
+                            txt = fetch_url_text(u)
+                            if txt:
+                                fetched.append((u, txt))
+                    if fetched:
+                        extra = ("\n\nCRITICAL - the client's own web tools are blocked by "
+                                 "an egress policy, so the gateway fetched the page FOR YOU. "
+                                 "Use the content below to answer; do NOT say you cannot "
+                                 "access it and do NOT call a web tool again:\n")
+                        for u, txt in fetched:
+                            extra += f"\n--- FETCHED {u} ---\n{txt}\n--- END {u} ---\n"
+                    elif blocked:
+                        # We could not fetch it either - be honest, don't loop.
+                        log.info("url-guard: gateway fetch also failed; forwarding text")
+                        extra = None
+                    else:
+                        log.info("url-guard: forcing a tool call for %s", user_urls[0])
+                        extra = build_url_guard_prompt(user_urls, web_names)
+                    if extra is None:
+                        raw2 = items2 = None
+                    else:
+                        raw2, used_model2, usage2 = chat_with_fallback(
+                            client, alias, "", decision_prompt + extra,
+                            image_paths=img_files or None, deadline=deadline,
+                            work_dir=work_dir)
+                    data2 = _extract_decision_json(raw2) if raw2 else None
+                    items2 = (_validate_decision_items(data2, valid_names, by_name)
+                              if data2 is not None else None)
+                    names2 = [i["name"] for i in items2 if i["type"] == "tool_use"] if items2 else []
+                    if items2 and (names2 or fetched):
+                        raw, used_model, usage = raw2, used_model2, usage2
+                        items, tool_names = items2, names2
+                        log.info("url-guard: answered with fetched content (%d url, %s)",
+                                 len(fetched), ",".join(names2[:3]) or "no tool call")
+                        log.info("url-guard: model acted (%s)", ",".join(names2[:3]))
+                    else:
+                        log.info("url-guard: still no tool call; forwarding text")
         # Forced-tool second attempt with a stronger forcing line. Skipped
         # when the budget is already spent (it would just burn the deadline).
         if retry_prompt and forced_name and forced_name not in tool_names:
@@ -1696,7 +2143,7 @@ def _decision_worker(alias: str, decision_prompt: str, retry_prompt: str | None,
                     image_paths=img_files or None, deadline=deadline,
                     work_dir=work_dir)
                 data2 = _extract_decision_json(raw2)
-                items2 = (_validate_decision_items(data2, valid_names)
+                items2 = (_validate_decision_items(data2, valid_names, by_name)
                           if data2 is not None else None)
                 tool_names2 = [i["name"] for i in items2
                                if i["type"] == "tool_use"] if items2 else []
@@ -1718,11 +2165,42 @@ def _decision_worker(alias: str, decision_prompt: str, retry_prompt: str | None,
                          sum(1 for i in salvaged if i["type"] == "tool_use"),
                          used_model)
                 items = salvaged
-            else:
-                full = raw.encode("unicode_escape").decode("ascii", "replace")
-                log.info("tool-decision parse failed (%d chars, model %s): %s",
-                         len(raw), used_model, full[:8000])
-                items = [{"type": "text", "text": raw[:4000]}]
+        if items is None and valid_names and DECISION_JSON_RETRY \
+                and (deadline is None or time.time() < deadline):
+            # The reply was prose, not the STRICT JSON the decision prompt
+            # demands. Forwarding prose throws away EVERY tool the client
+            # offered: the turn ends as "باشه — دارم می‌نویسم" with nothing
+            # executed, the user pokes it, and the model repeats the same
+            # promise (observed 13:33:51: 1567 chars of Persian prose, 31 tools
+            # discarded). One explicit re-ask recovers most of these.
+            log.info("decision-retry: reply was not JSON (%d chars, model %s); "
+                     "re-asking for JSON only", len(raw), used_model)
+            if log.isEnabledFor(logging.DEBUG):
+                log.debug("unparseable decision: %s",
+                          raw.encode("unicode_escape").decode("ascii", "replace")[:8000])
+            try:
+                raw3, used3, usage3 = chat_with_fallback(
+                    client, alias, "", decision_prompt + _JSON_ONLY_NUDGE,
+                    image_paths=img_files or None, deadline=deadline,
+                    work_dir=work_dir)
+                data3 = _extract_decision_json(raw3)
+                items3 = (_validate_decision_items(data3, valid_names, by_name)
+                          if data3 is not None else None)
+                if items3 is not None:
+                    raw, used_model, usage, items = raw3, used3, usage3, items3
+                    log.info("decision-retry: recovered a valid decision (%d tool_use) via %s",
+                             sum(1 for i in items if i["type"] == "tool_use"),
+                             used_model)
+                else:
+                    log.info("decision-retry: still not JSON; forwarding raw text")
+            except UpstreamError as e3:
+                log.info("decision-retry upstream failed (%s); forwarding raw text",
+                         str(e3)[:120])
+        if items is None:
+            full = raw.encode("unicode_escape").decode("ascii", "replace")
+            log.info("tool-decision parse failed (%d chars, model %s): %s",
+                     len(raw), used_model, full[:8000])
+            items = [{"type": "text", "text": raw[:4000]}]
     return raw, used_model, usage, items
 
 
@@ -1944,6 +2422,8 @@ async def anthropic_messages(request: Request):
     # ---- Tool-bridge path: never 400 for tools. ----
     valid_names = {str(t.get("name")) for t in tools
                    if isinstance(t, dict) and isinstance(t.get("name"), str) and t.get("name")}
+    tool_by_name = {str(t.get("name")): t for t in tools
+                    if isinstance(t, dict) and isinstance(t.get("name"), str) and t.get("name")}
     if mode == "forced" and forced_name not in valid_names:
         log.info("forced tool '%s' not in request tool list; treating as auto",
                  str(forced_name)[:80])
@@ -1956,10 +2436,13 @@ async def anthropic_messages(request: Request):
     # would hide exactly the long explore-stall we need to catch (compaction
     # keeps only the last HISTORY_KEEP_LAST messages).
     loop_repeats, ro_streak, explore_stall = detect_tool_loop(body.get("messages", []))
+    promise_streak = detect_broken_promises(body.get("messages", []))
     if loop_repeats or ro_streak >= READ_ONLY_STREAK_THRESHOLD \
-            or explore_stall >= EXPLORE_STALL_THRESHOLD:
-        log.info("loop-guard: %d repeated call(s), read-only streak %d, explore-stall %d",
-                 len(loop_repeats), ro_streak, explore_stall)
+            or explore_stall >= EXPLORE_STALL_THRESHOLD \
+            or promise_streak >= PROMISE_STREAK_THRESHOLD:
+        log.info("loop-guard: %d repeated call(s), read-only streak %d, "
+                 "explore-stall %d, promise-only streak %d",
+                 len(loop_repeats), ro_streak, explore_stall, promise_streak)
     all_msgs = body.get("messages", [])
     # The folder the user ATTACHED in Claude Desktop comes from the system
     # prompt, not the chat. It is authoritative: when present, it is the ONLY
@@ -1986,7 +2469,8 @@ async def anthropic_messages(request: Request):
         loop_repeats=loop_repeats, read_only_streak=ro_streak,
         explore_stall=explore_stall,
         project_paths=project_paths,
-        done_reads=done_reads, done_writes=done_writes)
+        done_reads=done_reads, done_writes=done_writes,
+        promise_streak=promise_streak)
     # Forced-tool retry is prepared here but executed inside the worker, so
     # the "one whole request" deadline covers BOTH attempts.
     retry_prompt = None
@@ -1995,11 +2479,14 @@ async def anthropic_messages(request: Request):
                         f"\nCRITICAL: your previous reply did not call {forced_name}; "
                         f"reply again with ONLY the JSON calling {forced_name}.")
     deadline = time.time() + TOTAL_BUDGET_S
+    # URLs the user actually pasted, so the guard can force a fetch if the
+    # model invents a "network is blocked" excuse.
+    user_urls = find_urls(transcript)
     try:
         raw, used_model, usage, items = await run_in_threadpool(
             _decision_worker, alias, decision_prompt, retry_prompt,
             img_files, valid_names, forced_name if retry_prompt else None,
-            deadline, work_dir)
+            deadline, work_dir, tool_by_name, user_urls, transcript)
     except UpstreamError as e:
         # 502 only if ALL combo models failed.
         return anthropic_error(502, f"upstream failed: {str(e)[:300]}")

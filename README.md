@@ -83,6 +83,39 @@ Restart the gateway after editing.
   `opencode serve` (or fix `.env`) and restart the gateway.
 - NOTE: requests are slowish (free models via serve: tens of seconds) and
   each request burns ~20k input tokens of opencode system prompt.
+## Why the agent looped, or wrote files you could not find (v3.1)
+
+Free models are weak at tool use, and three gateway bugs turned that into
+what looked like an agent that "forgot" its task. All three are fixed; the
+lines in quotes are what the log used to show.
+
+- **A project path with a space was cut in half.** `H:\AI\Claude Desktop`
+  was read as `H:\AI\Claude`, `is_dir()` failed, and the session ran in
+  another folder. Paths are now read whole, and a greedy match is trimmed
+  back to the longest prefix that is a real folder - never forward.
+- **Valid zero-argument tool calls were dropped.** `TaskList {}` is a
+  complete call; dropping it (`dropping tool_use 'TaskList' with empty
+  input`) meant no `tool_result` ever came back, so the model re-announced
+  "first let me check the task list" on every single turn. A declared schema
+  that demands nothing is forwarded as-is; a call missing required keys is
+  still refused, because a wrong call at least returns an error the model
+  can react to, while a dropped call is silent and loops.
+- **A prose reply ended the turn with a promise.** The decision prompt
+  demands JSON; when the model answered "I am writing the file now" the
+  gateway forwarded the prose and discarded every tool the client offered.
+  It now re-asks once for JSON (`decision-retry:` in the log), and after
+  `GATEWAY_PROMISE_STREAK_THRESHOLD` promise-only replies the model is shown
+  a `REPEAT GUARD` line that forbids announcing again and orders a tool call
+  (Persian and English intent verbs are both detected).
+- **Claude's own scratch folders are not your project.** A file written under
+  `local-agent-mode-sessions\...\outputs` is real but invisible in Explorer,
+  so "it wrote the file" and "there is no file" were both true. Those paths
+  never rank as the project (`GATEWAY_SCRATCH_MARKERS`), and the workspace
+  note now states the folder up front and warns that a path containing a
+  space must be passed whole and quoted.
+
+Every knob has a safe default: `GATEWAY_DECISION_JSON_RETRY`,
+`GATEWAY_PROMISE_STREAK_THRESHOLD`, `GATEWAY_SCRATCH_MARKERS`.
 
 ## Limits (v1)
 
