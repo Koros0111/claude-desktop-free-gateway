@@ -77,6 +77,28 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
+def _int_env_zero(name: str, default: int) -> int:
+    """Like _int_env, but 0 is a legal value ("0 disables this feature").
+
+    _int_env silently replaced 0 with the default, which made the documented
+    "set 0 to disable" knobs impossible to set from .env.
+    """
+    try:
+        val = int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+    return val if val >= 0 else default
+
+
+def _float_env_zero(name: str, default: float) -> float:
+    """Like _float_env, but 0 is a legal value ("0 disables this feature")."""
+    try:
+        val = float(os.getenv(name, str(default)))
+    except Exception:
+        return default
+    return val if val >= 0 else default
+
+
 # ---------------- config (no secrets are ever logged) ----------------
 GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", "local-dev-key-12345")
 OPENCODE_SERVE_URL = os.getenv("OPENCODE_SERVE_URL", "http://127.0.0.1:4097").rstrip("/")
@@ -117,7 +139,7 @@ _COOLDOWN_LOCK = threading.Lock()
 _MODEL_COOLDOWN: dict[str, float] = {}  # model_ref -> unix time of last failure
 # Inbound images live in sandbox/img for the duration of a request only.
 # This TTL (hours) bounds that dir so long sessions don't fill the disk.
-IMG_TTL_H = _float_env("GATEWAY_IMG_TTL_H", 6.0)
+IMG_TTL_H = _float_env_zero("GATEWAY_IMG_TTL_H", 6.0)
 GATEWAY_CAPTURE = os.getenv("GATEWAY_CAPTURE", "0") == "1"
 IMG_DIR = SESSION_DIR / "img"  # v3: saved inbound images for vision routing
 
@@ -955,7 +977,10 @@ LOOP_WINDOW = 12
 # "I am writing it right now" said N times in a row with no tool call behind
 # it. This is the loop the user actually sees (the model keeps promising the
 # same file), so it gets its own, lower threshold.
-PROMISE_STREAK_THRESHOLD = _int_env("GATEWAY_PROMISE_STREAK_THRESHOLD", 2)
+PROMISE_STREAK_THRESHOLD = _int_env_zero("GATEWAY_PROMISE_STREAK_THRESHOLD", 2)
+# 0 means "never inject the guard", not "warn on every turn": a threshold of 0
+# would otherwise be reached by a streak of 0 (a perfectly healthy turn).
+PROMISE_GUARD = PROMISE_STREAK_THRESHOLD > 0
 
 
 def _canonical_tool_input(inp) -> str:
@@ -1438,7 +1463,7 @@ def build_tool_decision_prompt(tools: list, tool_choice, transcript: str,
                   f"This turn you MUST either (a) make the actual edit with Edit/Write, "
                   f"or (b) reply with a final text summary of what you found. "
                   f"Answering 'I will continue' and reading more files is forbidden."]
-    if promise_streak >= PROMISE_STREAK_THRESHOLD:
+    if PROMISE_GUARD and promise_streak >= PROMISE_STREAK_THRESHOLD:
         parts += ["",
                   f"REPEAT GUARD: your last {promise_streak} replies promised to "
                   f"write/create something but contained NO tool_use, so nothing ever "
@@ -2439,7 +2464,7 @@ async def anthropic_messages(request: Request):
     promise_streak = detect_broken_promises(body.get("messages", []))
     if loop_repeats or ro_streak >= READ_ONLY_STREAK_THRESHOLD \
             or explore_stall >= EXPLORE_STALL_THRESHOLD \
-            or promise_streak >= PROMISE_STREAK_THRESHOLD:
+            or (PROMISE_GUARD and promise_streak >= PROMISE_STREAK_THRESHOLD):
         log.info("loop-guard: %d repeated call(s), read-only streak %d, "
                  "explore-stall %d, promise-only streak %d",
                  len(loop_repeats), ro_streak, explore_stall, promise_streak)
