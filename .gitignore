@@ -7,10 +7,26 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Runtime / local data
+# Runtime / local data (written on first run; every working tree would be dirty)
 sandbox/
 captures/
 *.log
+tool_catalog.json
+superpowers-dashboard.html
 
-# Local dev/test scripts (may contain private machine paths) - never publish
-test_*.py
+# Local probes stay private; only the offline regression suites ship with the
+# repo (test_tool_parity, test_folder_space, test_repeat_guard, test_agentic).
+# Everything else matching test_*.py is a local diagnostic - never publish it.
+test_e2e.py
+test_repro.py
+test_session_dir.py
+test_wrong_folder.py
+test_wander.py
+test_attached_folder.py
+test_web_tool.py
+test_fixes.py
+test_live_attached.py
+test_live_dash.py
+test_live_egress.py
+test_live_ledger.py
+test_live_stuck.py

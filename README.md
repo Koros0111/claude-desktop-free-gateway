@@ -97,9 +97,25 @@ lines in quotes are what the log used to show.
   complete call; dropping it (`dropping tool_use 'TaskList' with empty
   input`) meant no `tool_result` ever came back, so the model re-announced
   "first let me check the task list" on every single turn. A declared schema
-  that demands nothing is forwarded as-is; a call missing required keys is
-  still refused, because a wrong call at least returns an error the model
-  can react to, while a dropped call is silent and loops.
+  that demands nothing is forwarded as-is. A call that is merely incomplete
+  (`Write` with a path but no content) is forwarded too, because the client
+  answers with a `tool_result` error naming the missing field and the model
+  fixes it next turn. Only a call with literally nothing to judge it by is
+  dropped - a dropped call is silent, and silence is what made it repeat.
+- **Near-miss tool names were thrown away.** The desktop declares
+  `mcp__tools__TaskList`; small models answer `TaskList`, `tasklist`, or one
+  character off. Each is now corrected to the tool the client actually
+  declared (`tool name '...' corrected to the declared '...'`); a name that
+  maps to nothing is still refused, since forwarding that would make the
+  client error on every turn.
+- **A cut-off reply now admits it.** When the model runs out of output tokens
+  - or the salvage closes a JSON that stopped mid-call - the turn is reported
+  as `stop_reason: "max_tokens"` instead of `end_turn`, so Claude Desktop
+  offers Continue rather than leaving a half sentence with no way to finish it.
+- **One turn can hold several tool calls.** The old ceiling of four forced a
+  parallel step to be split across round trips; it is now
+  `GATEWAY_MAX_TOOL_USE_BLOCKS` (default 10), which is what makes multi-file
+  edits feel like native Claude again.
 - **A prose reply ended the turn with a promise.** The decision prompt
   demands JSON; when the model answered "I am writing the file now" the
   gateway forwarded the prose and discarded every tool the client offered.
@@ -113,9 +129,39 @@ lines in quotes are what the log used to show.
   never rank as the project (`GATEWAY_SCRATCH_MARKERS`), and the workspace
   note now states the folder up front and warns that a path containing a
   space must be passed whole and quoted.
+- **Zero means off where documented.** `GATEWAY_PROMISE_STREAK_THRESHOLD=0`
+  disables the repeat guard entirely (via `PROMISE_GUARD`), and
+  `GATEWAY_IMG_TTL_H=0` disables image pruning. These knobs read through
+  `_int_env_zero` / `_float_env_zero` (0 accepted, negatives still rejected),
+  because the plain readers turned 0 back into the default.
+- **Stop reasons stay honest.** `max_tokens` is reported only when upstream
+  itself says the reply was cut (`info.finish`, e.g. `length`) or when this
+  gateway cuts the text itself (the 4000-char fallbacks and the salvaged
+  cut-JSON path in `_decision_worker`). The client's `max_tokens` is NOT
+  forwarded: the serve message schema has no output-limit field and silently
+  ignores it (probed live: `{"max_tokens": 8}` got HTTP 200, finish `stop`,
+  full reply), so guessing truncation from token counts would label complete
+  answers truncated and make the Continue button lie. The OpenAI endpoint
+  mirrors the same evidence as `finish_reason` (`length` vs `stop`).
+- **Tool catalog is auditable.** With `GATEWAY_TOOL_CATALOG=true` (default),
+  every request merges the tools the client declared into `tool_catalog.json`
+  (override path via `GATEWAY_TOOL_CATALOG_PATH`): per tool, `description`,
+  `has_schema`, `zero_arg`, `required` and `properties` - names and schema
+  shapes only, never message content. The file is runtime data (gitignored);
+  point the path at a temp dir to inspect it without dirtying your tree.
 
 Every knob has a safe default: `GATEWAY_DECISION_JSON_RETRY`,
-`GATEWAY_PROMISE_STREAK_THRESHOLD`, `GATEWAY_SCRATCH_MARKERS`.
+`GATEWAY_PROMISE_STREAK_THRESHOLD`, `GATEWAY_SCRATCH_MARKERS`,
+`GATEWAY_MAX_TOOL_USE_BLOCKS`, `GATEWAY_PROJECT_LOG`, `GATEWAY_TOOL_CATALOG`.
+See `.env.example` for what each one does.
+
+To debug a tool call without the desktop app, run the gateway once and open
+`tool_catalog.json`: it records every tool Claude Desktop declared, with its
+required and property keys (names and schema shapes only, never message
+content). The offline suites in this repo (`test_tool_parity.py`,
+`test_folder_space.py`, `test_repeat_guard.py`, `test_agentic.py` - run each
+with `python <suite>.py`) replay the failures above with no network and no
+server; each bullet here has a check behind it.
 
 ## Limits (v1)
 

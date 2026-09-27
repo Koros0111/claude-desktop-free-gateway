@@ -37,6 +37,7 @@ Per-model image rejection (400/422) is an UpstreamError -> next fallback.
 """
 
 import base64
+import difflib
 import hashlib
 import json
 import logging
@@ -484,6 +485,13 @@ def chat_via_serve(client: httpx.Client, model_ref: str, system: str, prompt: st
         "input_tokens": int(tokens.get("input", 0) or 0),
         "output_tokens": int(tokens.get("output", 0) or 0),
     }
+    # Why the model stopped ("stop" | "length" | "tool-calls" | ...). Carried in
+    # the usage dict - which is never echoed to the client as a whole - so the
+    # Anthropic stop_reason can honestly say "max_tokens" when the reply was cut
+    # off instead of pretending the answer was finished.
+    fin = info.get("finish") if isinstance(info, dict) else None
+    if isinstance(fin, str) and fin:
+        usage["_finish"] = fin
     if not text:
         raise UpstreamError(f"empty reply (finish={info.get('finish') if isinstance(info, dict) else '?'})")
     return text, usage
@@ -905,6 +913,12 @@ def flatten_messages(messages: list,
 
 
 # ---------------- tool bridge (v2.0-beta: client executes, gateway decides) ----------------
+# A real Claude turn carries up to ~10 parallel tool calls (six Read/Grep calls
+# in one turn is normal for an agent). A lower cap is user-visible: the model
+# has to spend another round trip for the calls it was not allowed to make, so
+# the cap follows the client instead of throttling it.
+MAX_TOOL_USE_BLOCKS = _int_env("GATEWAY_MAX_TOOL_USE_BLOCKS", 10)
+
 TOOL_DECISION_ROLE = (
     "You are the reasoning engine behind an Anthropic-compatible assistant. "
     "You NEVER execute actions; you only decide the next response. "
@@ -912,10 +926,8 @@ TOOL_DECISION_ROLE = (
     '{"content": [{"type": "text", "text": "..."}, '
     '{"type": "tool_use", "name": "<tool>", "input": {...}}]}. '
     "You may output text-only, tool_use-only, or mixed (text first, then tool calls). "
-    "At most 4 tool_use blocks."
+    f"At most {MAX_TOOL_USE_BLOCKS} tool_use blocks. Name tools EXACTLY as listed."
 )
-
-MAX_TOOL_USE_BLOCKS = 4
 
 
 def _interpret_tool_choice(tool_choice) -> tuple[str, str | None]:
@@ -1127,11 +1139,18 @@ _PATH_LINE_END = re.compile(r"[\r\n]")
 # invisible to the user, so they must never be offered as "the project":
 #   local-agent-mode-sessions\...\outputs  - Claude Desktop local agent mode
 #   skills-plugin                          - Claude Desktop skill cache
+#   claude-3p                              - the whole Electron profile
+#                                          (Cache, logs, vm_bundles, IndexedDB,
+#                                           document-baselines, ... all under it)
+#   appdata\local\temp                     - scratch dirs Claude's tools use
 # (Found in the wild: the outputs dir outranked the user's real folder.)
 _SCRATCH_MARKERS = tuple(m.strip().lower() for m in
-                         os.getenv("GATEWAY_SCRATCH_MARKERS",
-                                   "local-agent-mode-sessions,skills-plugin"
-                                   ).split(",") if m.strip())
+                         os.getenv(
+                             "GATEWAY_SCRATCH_MARKERS",
+                             "local-agent-mode-sessions,skills-plugin,claude-3p,"
+                             "claude-code,claude-code-vm,vm_bundles,"
+                             "document-baselines,appdata\\local\\temp"
+                         ).split(",") if m.strip())
 
 
 def _is_scratch_path(p: str) -> bool:
@@ -1608,6 +1627,47 @@ def _required_keys(tool: dict) -> set:
     return set()
 
 
+_MCP_NS_RE = re.compile(r"^mcp__[^_]+__")
+
+
+def _canonical_tool_name(name: str, valid_names: set) -> str | None:
+    """Map a near-miss tool name to a tool the client actually declared.
+
+    Small models mutate tool names: they lowercase them, add or drop the MCP
+    namespace a client puts in front ("mcp__tools__TaskList"), or misspell one
+    character. A real Claude never does this, so the mismatch is ours to fix -
+    answering with the client's own spelling keeps the turn moving, while an
+    unmappable name still returns None because forwarding THAT makes the client
+    error on every single turn.
+    """
+    if not valid_names or not isinstance(name, str) or not name:
+        return None
+    if name in valid_names:
+        return name
+    lowered = {n.lower(): n for n in valid_names}
+    cand = lowered.get(name.lower())
+    if cand:
+        return cand
+    bare = _MCP_NS_RE.sub("", name)
+    if bare and bare != name:
+        cand = bare if bare in valid_names else lowered.get(bare.lower())
+        if cand:
+            return cand
+    for chunk in [p for p in name.split("__") if p]:  # "mcp__srv_name__Tool"
+        cand = chunk if chunk in valid_names else lowered.get(chunk.lower())
+        if cand:
+            return cand
+    # The model also DROPS the client's namespace: it answers "TaskList" when the
+    # desktop declared "mcp__tools__TaskList", because that is how the tool is
+    # written in the instructions it read. A unique "__"-suffix is the same tool.
+    suffix = "__" + name.lower()
+    hits = [n for n in valid_names if n.lower().endswith(suffix)]
+    if len(hits) == 1:
+        return hits[0]
+    close = difflib.get_close_matches(name, list(valid_names), n=1, cutoff=0.86)
+    return close[0] if close else None
+
+
 def _input_is_usable(name: str, inp: dict, tool_by_name: dict) -> bool:
     """Reject meaningless tool input instead of forwarding it.
 
@@ -1626,9 +1686,10 @@ def _input_is_usable(name: str, inp: dict, tool_by_name: dict) -> bool:
     forwarded. Real Claude Desktop tools declare
     {"type": "object", "properties": {}, "required": []} - no properties at
     all - which is why "has at least one property" is NOT the test.
-    We only refuse when there is no schema to judge by (the tool never declared
-    one): a wrong-but-parseable call still comes back as a tool_result error the
-    model can react to, while a dropped call is silent and loops.
+    We refuse only a call with literally nothing in it - no schema to judge by,
+    or a schema that demands arguments and none were given. A wrong-but-parseable
+    call comes back as a tool_result error the model can react to, while a
+    dropped call is silent, and silence is what makes a model repeat itself.
     """
     tool = tool_by_name.get(name)
     req = _required_keys(tool) if isinstance(tool, dict) else set()
@@ -1648,19 +1709,28 @@ def _input_is_usable(name: str, inp: dict, tool_by_name: dict) -> bool:
         missing = [k for k in (req or set())
                    if k not in inp or inp.get(k) in (None, "")]
         if missing:
-            log.info("dropping tool_use '%s' missing required input %s",
+            # FORWARD it anyway. The real API does not validate tool arguments -
+            # the tool implementation does - and the model gets a tool_result
+            # error naming the missing field, which it fixes next turn. Dropping
+            # the call erased the model's intent entirely (a Write with "path"
+            # but no "content" simply vanished), which reads to the user as the
+            # agent ignoring them, and starts the same repeat loop the
+            # zero-argument drop caused.
+            log.info("forwarding tool_use '%s' with incomplete input (missing %s); "
+                     "the client answers with an error the model can act on",
                      name[:80], ",".join(missing))
-            return False
     return True
 
 
 def _validate_decision_items(data: dict, valid_names: set[str],
                              tool_by_name: dict | None = None) -> list[dict] | None:
-    """Keep text/tool_use items; drop unknown tools; cap 4 tool_use. None = unusable.
+    """Keep text/tool_use items; correct near-miss tool names; drop calls the
+    client cannot run; cap MAX_TOOL_USE_BLOCKS tool_use per turn. None = unusable.
 
-    tool_by_name (optional) enables input validation: a tool call whose input
-    is empty or missing a required key is dropped so the model can retry
-    instead of the client erroring out on a malformed call.
+    tool_by_name (optional) enables input validation. A call with literally
+    nothing in it is dropped, because the client would only error; a call that
+    is merely incomplete is forwarded, so its tool_result tells the model what
+    to fix.
     """
     content = data.get("content")
     if not isinstance(content, list):
@@ -1675,11 +1745,19 @@ def _validate_decision_items(data: dict, valid_names: set[str],
         if t == "text" and isinstance(item.get("text"), str):
             kept.append({"type": "text", "text": item["text"]})
         elif t == "tool_use" and isinstance(item.get("name"), str):
-            name = item["name"]
-            if name not in valid_names:
-                log.info("dropping unknown tool_use '%s' (not in request tool list)", name[:80])
+            name = _canonical_tool_name(item["name"], valid_names)
+            if name is None:
+                log.info("dropping unknown tool_use '%s' (client declared %d tools; "
+                         "nearest: %s)", item["name"][:80], len(valid_names),
+                         difflib.get_close_matches(item["name"], list(valid_names),
+                                                   n=1, cutoff=0.5) or ["none"])
                 continue
+            if name != item["name"]:
+                log.info("tool name '%s' corrected to the declared '%s'",
+                         item["name"][:80], name[:80])
             if tool_count >= MAX_TOOL_USE_BLOCKS:
+                log.info("cap: dropped extra tool_use '%s' (%d per turn limit)",
+                         name[:80], MAX_TOOL_USE_BLOCKS)
                 continue
             inp = item.get("input", {})
             if not isinstance(inp, dict):
@@ -1829,6 +1907,73 @@ def maybe_capture_request(body: dict, tools: list) -> None:
         log.info("capture failed (%s)", type(e).__name__)
 
 
+# ---------------- tool catalog: record the tools the client really sends -----
+# Every judgement the bridge makes about a tool call - is it zero-argument, which
+# keys are required, is the name namespaced - depends on the schema the CLIENT
+# declares. Guessing those from memory is what produced the TaskList loop, so the
+# tool list each request carries is merged into tool_catalog.json: names and
+# schema shapes only, never user content, so the file is safe to keep or share.
+TOOL_CATALOG = os.getenv("GATEWAY_TOOL_CATALOG", "true").lower() != "false"
+TOOL_CATALOG_PATH = BASE_DIR / "tool_catalog.json"
+_catalog_lock = threading.Lock()
+_catalog_seen: set[str] = set()
+
+
+def record_tool_catalog(tools: list) -> None:
+    """Merge the declared tools into tool_catalog.json (cheap, best-effort)."""
+    if not TOOL_CATALOG or not tools:
+        return
+    try:
+        entry: dict[str, dict] = {}
+        for t in tools:
+            if not isinstance(t, dict):
+                continue
+            name = str(t.get("name", "") or "")
+            if not name:
+                continue
+            schema = t.get("input_schema") or t.get("parameters")
+            req = schema.get("required") if isinstance(schema, dict) else None
+            props = schema.get("properties") if isinstance(schema, dict) else None
+            entry[name] = {
+                "description": str(t.get("description", "") or "")[:300],
+                # has_schema and zero_arg are the two facts the bridge needs to
+                # judge {"name": "...", "input": {}}: a schema that demands
+                # nothing IS a valid no-argument call. Recording them here means
+                # the audit checks the client's real declaration, not memory.
+                "has_schema": isinstance(schema, dict),
+                "zero_arg": isinstance(schema, dict) and not props and not (req or []),
+                "required": sorted(str(k) for k in req) if isinstance(req, list) else [],
+                "properties": sorted(str(k) for k in props) if isinstance(props, dict) else [],
+            }
+        if not entry:
+            return
+        names = "|".join(sorted(entry))
+        with _catalog_lock:
+            if names in _catalog_seen:          # same tool list: nothing to write
+                return
+            _catalog_seen.add(names)
+            path = os.getenv("GATEWAY_TOOL_CATALOG_PATH", str(TOOL_CATALOG_PATH))
+            p = Path(path)
+            data: dict = {}
+            try:
+                if p.exists():
+                    old = json.loads(p.read_text(encoding="utf-8"))
+                    if isinstance(old, dict) and isinstance(old.get("tools"), dict):
+                        data = dict(old["tools"])
+            except Exception:
+                data = {}
+            data.update(entry)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps({"updated": int(time.time()),
+                                     "tool_count": len(data),
+                                     "tools": data},
+                                    ensure_ascii=False, indent=2, sort_keys=True),
+                         encoding="utf-8")
+            log.info("tool catalog: %d tool(s) -> %s", len(data), p.name)
+    except Exception as e:
+        log.debug("tool catalog write failed: %s", e)
+
+
 def check_gateway_auth(request: Request) -> str | None:
     """Return None if authorized, else an error string (never echoes the key)."""
     auth = request.headers.get("authorization", "")
@@ -1850,6 +1995,50 @@ def anthropic_error(status: int, message: str) -> JSONResponse:
 
 def sse_event(name: str, payload: dict) -> str:
     return f"event: {name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+# why the client's max_tokens is never forwarded upstream: the serve
+# POST /session/{id}/message schema (GET /doc, opencode 1.18.x) accepts only
+# messageID/model/agent/noReply/tools/format/system/variant/parts - there is
+# no output-limit field - and a live probe sending {"max_tokens": 8} got
+# HTTP 200 with finish "stop" and the full reply, so the field is silently
+# ignored. repro (password redacted): headers = serve_headers(); GET /doc for
+# the schema, then POST /session/{id}/message with {"max_tokens": 8} and read
+# info.finish/info.tokens. that is why "max_tokens" here fires only when
+# upstream itself says so (info.finish) or when this gateway cuts the text
+# itself (the 4000-char fallbacks and the salvaged cut-JSON path in
+# _decision_worker). never guess from token counts: against a limit-ignoring
+# upstream that labels complete answers truncated and makes Continue lie.
+_TRUNCATED_FINISHES = ("length", "max_tokens", "max-length", "maxlength",
+                       "max_output_tokens", "incomplete")
+
+
+def _is_truncated(usage: dict | None) -> bool:
+    """True when upstream said the reply hit the token limit."""
+    if not isinstance(usage, dict):
+        return False
+    return str(usage.get("_finish", "")).lower().strip() in _TRUNCATED_FINISHES
+
+
+def _stop_reason(has_tool_use: bool, truncated: bool) -> str:
+    """The stop_reason a real Claude would report for this turn.
+
+    "max_tokens" is not cosmetic: Claude Desktop only shows its Continue
+    affordance when the answer was cut off. Reporting "end_turn" on a half
+    sentence leaves the user with a truncated reply and no way to ask for the
+    rest, which is one of the clearest tells that a proxy is in the middle.
+    """
+    if has_tool_use:
+        return "tool_use"
+    return "max_tokens" if truncated else "end_turn"
+
+
+def _openai_finish(usage: dict | None) -> str:
+    """OpenAI finish_reason from the same evidence as _stop_reason.
+
+    OpenAI's vocabulary is "stop"/"length" - never Anthropic names.
+    """
+    return "length" if _is_truncated(usage) else "stop"
 
 
 def anthropic_sse_blocks(blocks: list[dict], alias: str, msg_id: str,
@@ -1897,6 +2086,8 @@ def anthropic_sse_blocks(blocks: list[dict], alias: str, msg_id: str,
 
 
 def anthropic_sse(text: str, alias: str, msg_id: str, usage: dict) -> StreamingResponse:
+    stop_reason = _stop_reason(False, _is_truncated(usage))
+
     async def gen():
         yield sse_event("message_start", {"type": "message_start", "message": {
             "id": msg_id, "type": "message", "role": "assistant", "model": alias,
@@ -1909,7 +2100,7 @@ def anthropic_sse(text: str, alias: str, msg_id: str, usage: dict) -> StreamingR
                                                 "delta": {"type": "text_delta", "text": text}})
         yield sse_event("content_block_stop", {"type": "content_block_stop", "index": 0})
         yield sse_event("message_delta", {"type": "message_delta",
-                                          "delta": {"stop_reason": "end_turn"},
+                                          "delta": {"stop_reason": stop_reason},
                                           "usage": {"output_tokens": usage.get("output_tokens", 0)}})
         yield sse_event("message_stop", {"type": "message_stop"})
     return StreamingResponse(gen(), media_type="text/event-stream")
@@ -2053,20 +2244,40 @@ def _chat_worker(alias: str, system: str, prompt: str,
                                   work_dir=work_dir)
 
 
+def _looks_like_cut_decision(raw: str) -> bool:
+    """True when the reply BEGAN as decision JSON and stopped part-way through.
+
+    That shape means the output limit was hit, no matter whether the salvage
+    managed to close the tail: the answer we hand over is missing everything
+    after the last complete block, so the turn must not be reported as finished.
+    """
+    if not isinstance(raw, str):
+        return False
+    base = raw.strip()
+    if not base.startswith("{") or _extract_decision_json(base) is not None:
+        return False
+    return '"tool_use"' in base or '"content"' in base
+
+
 def _decision_worker(alias: str, decision_prompt: str, retry_prompt: str | None,
                      img_files: list[dict] | None, valid_names: set[str],
                      forced_name: str | None, deadline: float,
                      work_dir: Path | None = None,
                      tool_by_name: dict | None = None,
                      user_urls: list[str] | None = None,
-                     transcript: str = ""
+                     transcript: str = "",
+                     meta: dict | None = None
                      ) -> tuple[str, str, dict, list[dict]]:
     """Run the tool-bridge decision (and optional forced retry) off-loop.
 
     Returns (raw, used_model, usage, items). items is already salvaged or
     text-wrapped, so the caller only has to assign ids and respond.
+    meta (optional dict) receives meta["truncated"] = True when the reply we are
+    about to hand over is cut off, so the caller can report stop_reason
+    "max_tokens" and Claude Desktop offers its Continue button.
     """
     by_name = tool_by_name or {}
+    meta = meta if isinstance(meta, dict) else {}
     with _new_client(timeout=UPSTREAM_TIMEOUT) as client:
         raw, used_model, usage = chat_with_fallback(
             client, alias, "", decision_prompt,
@@ -2179,6 +2390,8 @@ def _decision_worker(alias: str, decision_prompt: str, retry_prompt: str | None,
                     log.info("forced tool '%s' still absent; text fallback (never 502)",
                              forced_name[:80])
                     items = [{"type": "text", "text": raw2[:4000]}]
+                    if len(raw2) > 4000:
+                        meta["truncated"] = True
             except UpstreamError as e2:
                 # Retry failed but first attempt may still be usable.
                 log.info("forced retry upstream failed (%s); using first attempt",
@@ -2190,6 +2403,11 @@ def _decision_worker(alias: str, decision_prompt: str, retry_prompt: str | None,
                          sum(1 for i in salvaged if i["type"] == "tool_use"),
                          used_model)
                 items = salvaged
+            if salvaged is not None or _looks_like_cut_decision(raw):
+                # The reply stopped mid-JSON: whatever came after the last
+                # complete block is gone, salvaged or not, so this turn is NOT
+                # finished and Claude Desktop must offer to continue it.
+                meta["truncated"] = True
         if items is None and valid_names and DECISION_JSON_RETRY \
                 and (deadline is None or time.time() < deadline):
             # The reply was prose, not the STRICT JSON the decision prompt
@@ -2226,6 +2444,9 @@ def _decision_worker(alias: str, decision_prompt: str, retry_prompt: str | None,
             log.info("tool-decision parse failed (%d chars, model %s): %s",
                      len(raw), used_model, full[:8000])
             items = [{"type": "text", "text": raw[:4000]}]
+            if len(raw) > 4000:
+                # We are cutting the reply ourselves; say so with stop_reason.
+                meta["truncated"] = True
     return raw, used_model, usage, items
 
 
@@ -2439,7 +2660,7 @@ async def anthropic_messages(request: Request):
         return {
             "id": msg_id, "type": "message", "role": "assistant", "model": alias,
             "content": [{"type": "text", "text": text}],
-            "stop_reason": "end_turn",
+            "stop_reason": _stop_reason(False, _is_truncated(usage)),
             "usage": {"input_tokens": usage.get("input_tokens", 0),
                       "output_tokens": usage.get("output_tokens", 0)},
         }
@@ -2456,6 +2677,7 @@ async def anthropic_messages(request: Request):
     transcript, img_files, images_omitted, images_attached, _kept = _prepare_vision(
         body.get("messages", []), alias)
     maybe_capture_request(body, tools)
+    record_tool_catalog(tools)
     # Loop detection runs on the FULL history, not the compacted one. The guard
     # is a safety signal about the agent's behaviour, so dropping early turns
     # would hide exactly the long explore-stall we need to catch (compaction
@@ -2508,16 +2730,18 @@ async def anthropic_messages(request: Request):
     # model invents a "network is blocked" excuse.
     user_urls = find_urls(transcript)
     try:
+        decision_meta: dict = {}
         raw, used_model, usage, items = await run_in_threadpool(
             _decision_worker, alias, decision_prompt, retry_prompt,
             img_files, valid_names, forced_name if retry_prompt else None,
-            deadline, work_dir, tool_by_name, user_urls, transcript)
+            deadline, work_dir, tool_by_name, user_urls, transcript, decision_meta)
     except UpstreamError as e:
         # 502 only if ALL combo models failed.
         return anthropic_error(502, f"upstream failed: {str(e)[:300]}")
     blocks = _assign_tool_ids(items)
     has_use = any(b["type"] == "tool_use" for b in blocks)
-    stop_reason = "tool_use" if has_use else "end_turn"
+    stop_reason = _stop_reason(has_use, bool(decision_meta.get("truncated"))
+                               or _is_truncated(usage))
     names_s = ",".join(b["name"] for b in blocks if b["type"] == "tool_use")
     if has_use:
         log.info("bridged %d tools -> %d tool_use (%s) via %s",
@@ -2576,7 +2800,7 @@ async def openai_chat(request: Request):
         return {
             "id": chat_id, "object": "chat.completion", "created": created, "model": alias,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                         "finish_reason": "stop"}],
+                         "finish_reason": _openai_finish(usage)}],
             "usage": {"prompt_tokens": usage.get("input_tokens", 0),
                       "completion_tokens": usage.get("output_tokens", 0),
                       "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0)},
@@ -2590,7 +2814,7 @@ async def openai_chat(request: Request):
         yield "data: " + json.dumps(head, ensure_ascii=False) + "\n\n"
         tail = {"id": chat_id, "object": "chat.completion.chunk", "created": created,
                 "model": alias, "choices": [{"index": 0, "delta": {},
-                                             "finish_reason": "stop"}]}
+                                              "finish_reason": _openai_finish(usage)}]}
         yield "data: " + json.dumps(tail) + "\n\n"
         yield "data: [DONE]\n\n"
     return StreamingResponse(gen(), media_type="text/event-stream")
