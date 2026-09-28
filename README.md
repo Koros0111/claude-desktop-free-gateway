@@ -89,8 +89,8 @@ Free models are weak at tool use, and three gateway bugs turned that into
 what looked like an agent that "forgot" its task. All three are fixed; the
 lines in quotes are what the log used to show.
 
-- **A project path with a space was cut in half.** `H:\AI\Claude Desktop`
-  was read as `H:\AI\Claude`, `is_dir()` failed, and the session ran in
+- **A project path with a space was cut in half.** `C:\Users\YOU\My Project`
+  was read as `C:\Users\YOU\My`, `is_dir()` failed, and the session ran in
   another folder. Paths are now read whole, and a greedy match is trimmed
   back to the longest prefix that is a real folder - never forward.
 - **Valid zero-argument tool calls were dropped.** `TaskList {}` is a
@@ -149,10 +149,22 @@ lines in quotes are what the log used to show.
   `has_schema`, `zero_arg`, `required` and `properties` - names and schema
   shapes only, never message content. The file is runtime data (gitignored);
   point the path at a temp dir to inspect it without dirtying your tree.
+- **Rewriting one file forever is stopped.** Consecutive successful writes to
+  the same path (counted since your last message; error results never count,
+  a new instruction resets) steer at 3 ("state the one defect or finish in
+  text"), refuse the write with an error text at 5, and force an honest
+  text-only turn at 8. Different files never accumulate together.
+- **Every user message has a turn budget.** Above `GATEWAY_MAX_TURNS_PER_MESSAGE`
+  (default 30, 0 disables) the gateway stops offering tools and closes with a
+  summary text - the backstop for loop shapes no guard knows yet. Never a 502.
+- **Guard decisions reach disk.** `GATEWAY_LOG_FILE` (default
+  `sandbox/_gw.err.log`, empty disables) mirrors gateway logs to a file,
+  because uvicorn otherwise shows them only in its own terminal.
 
 Every knob has a safe default: `GATEWAY_DECISION_JSON_RETRY`,
 `GATEWAY_PROMISE_STREAK_THRESHOLD`, `GATEWAY_SCRATCH_MARKERS`,
-`GATEWAY_MAX_TOOL_USE_BLOCKS`, `GATEWAY_PROJECT_LOG`, `GATEWAY_TOOL_CATALOG`.
+`GATEWAY_MAX_TOOL_USE_BLOCKS`, `GATEWAY_PROJECT_LOG`, `GATEWAY_TOOL_CATALOG`,
+`GATEWAY_MAX_TURNS_PER_MESSAGE`, `GATEWAY_LOG_FILE`.
 See `.env.example` for what each one does.
 
 To debug a tool call without the desktop app, run the gateway once and open
@@ -252,4 +264,7 @@ Debug: set `GATEWAY_CAPTURE=1` in `.env` (default `0`) and restart — the
 gateway saves a sanitized request (model, tool names+schemas truncated,
 message text truncated to 300 chars, images replaced with
 `[image N bytes]`) per tool-bridged turn into `captures/` with a
-timestamp name. Send that file when reporting a failing payload.
+timestamp name. Messages are written first so they always survive; excess
+tools spill with a `tools_dropped` note and old files rotate past
+`GATEWAY_CAPTURE_KEEP`. Every file is valid JSON. Send that file when
+reporting a failing payload.

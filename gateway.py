@@ -205,6 +205,31 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("gateway")
 
 
+def _attach_file_log() -> None:
+    """Mirror gateway logs to GATEWAY_LOG_FILE as well as the console.
+
+    Uvicorn otherwise shows them only in its own terminal, which is why guard
+    decisions were invisible during debugging. Empty value disables mirroring.
+    """
+    path = os.getenv("GATEWAY_LOG_FILE", str(SESSION_DIR / "_gw.err.log"))
+    if not path:
+        return
+    try:
+        if any(isinstance(h, logging.FileHandler) for h in log.handlers):
+            return  # reimport-safe: never attach twice
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(path, encoding="utf-8")
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        log.addHandler(handler)
+        log.info("file log: mirroring gateway logs -> %s", path)
+    except Exception as e:
+        log.info("file log disabled (%s)", type(e).__name__)
+
+
+_attach_file_log()
+
+
 def _mask(value: str) -> str:
     """Mask a secret for logs: first 2 + **** + last 2 (never full)."""
     if not value:
@@ -1119,8 +1144,172 @@ def detect_broken_promises(messages: list) -> int:
     return streak
 
 
+# ------------- path-repeat guard (the same-file rewrite loop) -------------
+# The other guards are blind here: every turn HAS a tool_use (promise streak
+# stays 0), every turn mutates (read-only/explore streaks break), and the
+# content varies so exact-repeat never matches. What repeats is the PATH.
+# All state comes from the request history - nothing is kept between turns.
+PATH_REPEAT_STEER = 3  # steering line in the decision prompt from here on
+PATH_REPEAT_REFUSE = 5  # drop the next write to that path from here on
+PATH_REPEAT_TEXT_ONLY = 8  # force an honest text-only turn from here on
+
+
+def turn_budget() -> int:
+    """Max assistant turns per user message; 0 disables the budget."""
+    return _int_env_zero("GATEWAY_MAX_TURNS_PER_MESSAGE", 30)
+
+
+def _is_new_instruction(m) -> bool:
+    """True for a user message carrying real text (a human instruction).
+
+    Pure tool_result carriers (role=user, no text) NEVER reset the guards:
+    they arrive after every tool turn, so treating them as "new" would blind
+    every history-derived counter. A mixed message (text + results) is new.
+    """
+    if not isinstance(m, dict) or m.get("role") != "user":
+        return False
+    content = m.get("content", "")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        return any(isinstance(b, dict) and b.get("type") == "text"
+                   and isinstance(b.get("text"), str) and b["text"].strip()
+                   for b in content)
+    return False
+
+
+def _canonical_repeat_path(p: str) -> str:
+    """Canonical file path for repeat comparison (strings only, no disk)."""
+    return str(p).strip().casefold().replace("/", "\\").rstrip("\\")
+
+
+def _repeat_tool_path(name: str, inp) -> str:
+    """Canonical path of a mutating file-tool call, or "" when it has none."""
+    if _tool_kind(name) != "mutate":
+        return ""
+    if not isinstance(inp, dict):
+        return ""
+    path = inp.get("file_path") or inp.get("notebook_path") or inp.get("path")
+    if not isinstance(path, str) or not path.strip():
+        return ""
+    return _canonical_repeat_path(path)
+
+
+def _result_is_error(block) -> bool:
+    """True when a tool_result reports failure (never counts as progress).
+
+    is_error wins; otherwise the text must SAY error up front. A write whose
+    result is missing (dropped call, unknown id) is also not a success.
+    """
+    if not isinstance(block, dict) or block.get("type") != "tool_result":
+        return False
+    if block.get("is_error") is True:
+        return True
+    content = block.get("content")
+    if isinstance(content, dict) and "error" in content:
+        return True
+    text = _tool_result_text(content).strip().lower()
+    return text.startswith("error") or "error:" in text[:80]
+
+
+def detect_path_repeat(messages: list) -> dict:
+    """Count consecutive successful writes per canonical path.
+
+    Returns {canon_path: [count, display_path]}. Only mutating file-tool
+    calls with a verified SUCCESS tool_result count; error results and
+    unverifiable (id-less, result-less) calls never do. A text-bearing user
+    message resets the run; tool_result-only carriers do not.
+    """
+    counts: dict = {}
+    pending: dict = {}  # tool_use id -> (canon, display)
+    for m in messages or []:
+        if _is_new_instruction(m):
+            counts.clear()
+            pending.clear()
+            continue
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content", "")
+        if not isinstance(content, list):
+            continue
+        if m.get("role") == "assistant":
+            for b in content:
+                if (isinstance(b, dict) and b.get("type") == "tool_use"
+                        and isinstance(b.get("name"), str)):
+                    canon = _repeat_tool_path(b["name"], b.get("input", {}))
+                    tid = b.get("id")
+                    if canon and isinstance(tid, str) and tid:
+                        pending[tid] = (canon, str(
+                            (b.get("input", {}) or {}).get("file_path")
+                            or (b.get("input", {}) or {}).get("notebook_path")
+                            or (b.get("input", {}) or {}).get("path")))
+        elif m.get("role") == "user":
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    tid = b.get("tool_use_id")
+                    hit = pending.pop(tid, None) if isinstance(tid, str) else None
+                    if hit is not None and not _result_is_error(b):
+                        canon, display = hit
+                        entry = counts.get(canon)
+                        if entry is not None:
+                            entry[0] += 1
+                        else:
+                            counts[canon] = [1, display]
+    return counts
+
+
+def hottest_path(counts: dict) -> tuple | None:
+    """The most-rewritten path as (canon, count, display), or None."""
+    if not counts:
+        return None
+    canon, (n, display) = max(counts.items(), key=lambda kv: kv[1][0])
+    return (canon, n, display)
+
+
+def count_assistant_turns(messages: list) -> int:
+    """Assistant messages since the last text-bearing user message."""
+    turns = 0
+    for m in messages or []:
+        if _is_new_instruction(m):
+            turns = 0
+        elif isinstance(m, dict) and m.get("role") == "assistant":
+            turns += 1
+    return turns
+
+
+def apply_path_repeat_refusal(items: list, hot: dict) -> tuple:
+    """Drop tool_use writes to refused paths; append one error text per path.
+
+    hot maps canon_path -> [count, display] for paths at/above REFUSE.
+    Anthropic has no gateway->client tool_result, so the refusal travels as
+    an error TEXT block: it lands in history and the model can react to it,
+    where a silent drop would only restart the loop.
+    """
+    kept: list = []
+    refused: list = []
+    for item in items or []:
+        if isinstance(item, dict) and item.get("type") == "tool_use":
+            canon = _repeat_tool_path(item.get("name", ""),
+                                      item.get("input", {}))
+            if canon and canon in hot:
+                count, display = hot[canon]
+                refused.append((display, count))
+                continue
+        kept.append(item)
+    seen: list = []
+    for display, count in refused:
+        if display not in [s for s, _ in seen]:
+            seen.append((display, count))
+    for display, count in seen:
+        kept.append({"type": "text", "text": (
+            "Error: not rewriting '%s' - already written %d times since your "
+            "last message with no new instruction. Summarize the current "
+            "state in text instead." % (display, count))})
+    return kept, refused
+
+
 # A Windows folder name may contain SPACES. The old character class stopped at
-# the first space, so "H:\AI\Claude Desktop" was reported as "H:\AI\Claude":
+# the first space, so "C:\Users\YOU\My Project" was reported as "C:\Users\YOU\My":
 # that path fails is_dir(), the real project was silently dropped, and the
 # session fell back to whatever OTHER path the transcript happened to mention
 # (Claude Desktop's ephemeral ...\outputs folder). Deliverables then landed
@@ -1421,10 +1610,11 @@ def build_tool_decision_prompt(tools: list, tool_choice, transcript: str,
                                loop_repeats: list | None = None,
                                read_only_streak: int = 0,
                                explore_stall: int = 0,
-                               project_paths: list | None = None,
-                               done_reads: list | None = None,
-                               done_writes: list | None = None,
-                               promise_streak: int = 0) -> str:
+                                project_paths: list | None = None,
+                                done_reads: list | None = None,
+                                done_writes: list | None = None,
+                                promise_streak: int = 0,
+                                path_repeat: tuple | None = None) -> str:
     if isinstance(max_tokens, bool):
         budget = 2000
     elif isinstance(max_tokens, int):
@@ -1492,6 +1682,14 @@ def build_tool_decision_prompt(tools: list, tool_choice, transcript: str,
                   f"project folder listed above, or (b) state in one sentence what is "
                   f"blocking you. Announcing that you are about to write is forbidden - "
                   f"write it."]
+    if path_repeat is not None:
+        _canon, _count, _display = path_repeat
+        parts += ["",
+                  f"PATH-REPEAT WARNING: you have written '{_display}' "
+                  f"{_count} times since the user's last message, with no new "
+                  f"instruction. Do NOT rewrite it. Either finish and answer "
+                  f"in text, or state the one concrete defect you are fixing "
+                  f"with this write."]
     if system_text:
         parts += ["", "System:", system_text]
     parts += ["", ("Keep text parts concise. Ensure every tool_use input is a JSON object "
@@ -1521,9 +1719,9 @@ _BAD_ESCAPE_RE = re.compile(r"(?<!\\)\\(?![\"\\/bfnrtu])")
 def _escape_drive_paths(s: str) -> str:
     """Double single backslashes inside Windows drive-path tokens.
 
-    Free models often emit tool inputs like "H:\\AI\\faktino\\apps" with
-    single backslashes (invalid JSON, and "\\f" would even parse as a
-    formfeed). Doubling them inside drive-letter tokens preserves paths.
+    Free models often emit tool inputs like "C:\\Users\\YOU\\My Project\\app" with
+    single backslashes (invalid JSON, and "\\U" would even parse as a
+    unicode escape). Doubling them inside drive-letter tokens preserves paths.
     Already-escaped ("\\\\") sequences are left alone.
     """
 
@@ -1894,14 +2092,51 @@ def maybe_capture_request(body: dict, tools: list) -> None:
             else:
                 sc = str(c)[:300]
             msgs.append({"role": str(m.get("role", ""))[:16], "content": sc})
-        payload = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                   "model": str(body.get("model", ""))[:80],
-                   "tool_choice": str(body.get("tool_choice", ""))[:160],
-                   "max_tokens": body.get("max_tokens"),
-                   "tools": tool_info, "messages": msgs}
+        # messages FIRST: with a big Cowork tool surface the old tools-first
+        # order (plus a blind [:20000] slice) buried messages past the cap and
+        # even wrote invalid JSON. tool shapes stay recoverable separately in
+        # tool_catalog.json, so tools shrink first and messages never do silently.
+        head = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "model": str(body.get("model", ""))[:80],
+                "tool_choice": str(body.get("tool_choice", ""))[:160],
+                "max_tokens": body.get("max_tokens")}
+        cap_chars = _int_env("GATEWAY_CAPTURE_MAX_CHARS", 60000)
+        doc_tools, doc_msgs = list(tool_info), list(msgs)
+        dropped_tools, dropped_msgs = 0, 0
+        while True:
+            doc = dict(head, messages=doc_msgs, tools=doc_tools)
+            if dropped_tools:
+                doc["tools_dropped"] = dropped_tools
+            if dropped_msgs:
+                doc["messages_dropped_front"] = dropped_msgs
+            text = json.dumps(doc, ensure_ascii=False)
+            if len(text) <= cap_chars:
+                break
+            if doc_tools:
+                doc_tools.pop()
+                dropped_tools += 1
+                continue
+            if len(doc_msgs) > 1:
+                doc_msgs.pop(0)
+                dropped_msgs += 1
+                continue
+            text = json.dumps(dict(head, note="request too large to capture",
+                                   messages=len(msgs), tools=len(tool_info)),
+                              ensure_ascii=False)
+            break
         fname = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6] + ".json"
-        (cap_dir / fname).write_text(json.dumps(payload, ensure_ascii=False)[:20000],
-                                     encoding="utf-8")
+        (cap_dir / fname).write_text(text, encoding="utf-8")
+        try:
+            # bound the dir: a long session must not fill the disk. oldest go.
+            keep = _int_env("GATEWAY_CAPTURE_KEEP", 100)
+            old = sorted(cap_dir.glob("*.json"), key=lambda p: p.name)
+            while len(old) >= keep and len(old) > 1:
+                try:
+                    old.pop(0).unlink()
+                except Exception:
+                    break
+        except Exception:
+            pass
         log.info("captured sanitized request -> captures/%s", fname)
     except Exception as e:
         log.info("capture failed (%s)", type(e).__name__)
@@ -2709,6 +2944,57 @@ async def anthropic_messages(request: Request):
     if PROJECT_LOG:
         log.info("project: paths=%s work_dir=%s reads=%d",
                  project_paths or "[]", work_dir, len(done_reads))
+    # Same-file rewrite + turn-budget guards (FULL history, like above).
+    path_counts = detect_path_repeat(all_msgs)
+    hot = hottest_path(path_counts)
+    budget = turn_budget()
+    turns = count_assistant_turns(all_msgs)
+    if budget > 0 and turns > budget:
+        # Backstop for loop shapes no guard knows yet: close with a summary,
+        # never a 502 and never silence.
+        log.info("turn-budget: %d assistant turns since last user message "
+                 "(max %d); text-only close", turns, budget)
+        close_text = (
+            "Stopped after %d steps without a new instruction from you; here "
+            "is where things stand: already read %d path(s), modified %d "
+            "path(s), working folder %s. Send a new message to continue."
+            % (turns, len(done_reads), len(done_writes), work_dir))
+        zero_usage = {"input_tokens": 0, "output_tokens": 0}
+        if stream:
+            return anthropic_sse_blocks(
+                [{"type": "text", "text": close_text}],
+                alias, msg_id, zero_usage, "end_turn")
+        return {
+            "id": msg_id, "type": "message", "role": "assistant", "model": alias,
+            "content": [{"type": "text", "text": close_text}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }
+    if hot is not None and hot[1] >= PATH_REPEAT_TEXT_ONLY:
+        _canon, _count, _display = hot
+        # 8 rewrites of one file: stop spending live turns on it.
+        log.info("path-repeat: '%s' written %d times since last user "
+                 "message; text-only turn", _display, _count)
+        status_text = (
+            "Stopped rewriting '%s' - already written %d times since your "
+            "last message, with nothing new asked. The file is on disk at "
+            "%s; review it there. Send a new message (the one defect to fix, "
+            "or approval to finish) to continue." % (_display, _count, _display))
+        zero_usage = {"input_tokens": 0, "output_tokens": 0}
+        if stream:
+            return anthropic_sse_blocks(
+                [{"type": "text", "text": status_text}],
+                alias, msg_id, zero_usage, "end_turn")
+        return {
+            "id": msg_id, "type": "message", "role": "assistant", "model": alias,
+            "content": [{"type": "text", "text": status_text}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }
+    steer = hot if hot is not None and hot[1] >= PATH_REPEAT_STEER else None
+    if steer is not None:
+        log.info("path-repeat: steering '%s' (%d writes since last user message)",
+                 steer[2], steer[1])
     decision_prompt = build_tool_decision_prompt(
         [t for t in tools if isinstance(t, dict)], tool_choice,
         transcript, system, images_omitted, body.get("max_tokens"),
@@ -2717,7 +3003,7 @@ async def anthropic_messages(request: Request):
         explore_stall=explore_stall,
         project_paths=project_paths,
         done_reads=done_reads, done_writes=done_writes,
-        promise_streak=promise_streak)
+        promise_streak=promise_streak, path_repeat=steer)
     # Forced-tool retry is prepared here but executed inside the worker, so
     # the "one whole request" deadline covers BOTH attempts.
     retry_prompt = None
@@ -2738,6 +3024,14 @@ async def anthropic_messages(request: Request):
     except UpstreamError as e:
         # 502 only if ALL combo models failed.
         return anthropic_error(502, f"upstream failed: {str(e)[:300]}")
+    refused_paths = {canon: entry for canon, entry in path_counts.items()
+                     if entry[0] >= PATH_REPEAT_REFUSE}
+    if refused_paths:
+        items, refused = apply_path_repeat_refusal(items, refused_paths)
+        for _display, _count in refused:
+            log.info("path-repeat: refusing Write to '%s' (%d writes since "
+                     "last user message); dropped, error text sent",
+                     _display, _count)
     blocks = _assign_tool_ids(items)
     has_use = any(b["type"] == "tool_use" for b in blocks)
     stop_reason = _stop_reason(has_use, bool(decision_meta.get("truncated"))
